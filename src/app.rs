@@ -68,7 +68,7 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::RedrawRequested => {
                 log::info!("Redraw Request");
@@ -77,6 +77,13 @@ impl ApplicationHandler for App {
 
                 renderer.render();
             },
+			WindowEvent::Resized(_) => {
+				log::info!("Window Resized");
+
+				let renderer = self.renderer.as_mut().unwrap();
+
+				renderer.resize();
+			}
             WindowEvent::CloseRequested => {
                 log::info!("Close Requested");
                 event_loop.exit();

@@ -1,14 +1,55 @@
 use std::sync::Arc;
 use winit::window::Window;
+use wesl::include_wesl;
 
 use anyhow::{Context, anyhow};
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
+struct Immediate {
+	window_size: [u32; 2],
+	aspect_ratio: [f32; 2],
+}
+
+impl Immediate {
+	pub fn new(window_width: u32, window_height: u32) -> Self {
+		Self {
+			window_size: [window_width, window_height],
+			aspect_ratio: Self::compute_aspect_ratio(window_width, window_height),
+		}
+	}
+
+	pub fn update_window_size(&mut self, window_width: u32, window_height: u32) {
+		self.window_size = [window_width, window_height];
+		self.aspect_ratio = Self::compute_aspect_ratio(window_width, window_height);
+	}
+
+	pub fn compute_aspect_ratio(window_width: u32, window_height: u32) -> [f32; 2] {
+		if window_width < window_height {
+			[1.0, window_height as f32 / window_width as f32]
+		} else {
+			[window_width as f32 / window_height as f32, 1.0]
+		}
+	}
+}
+
 pub struct Renderer {
+	render_pipeline: wgpu::RenderPipeline,
 	device: wgpu::Device,
 	queue: wgpu::Queue,
 	surface: wgpu::Surface<'static>,
 	surface_config: wgpu::SurfaceConfiguration,
+	immediate: Immediate,
 	window: Arc<Window>,
+}
+
+macro_rules! load_shader {
+    ($device:expr, $path:literal, $label:literal) => {
+        $device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some($label),
+            source: wgpu::ShaderSource::Wgsl(include_wesl!($path).into()),
+        })
+    };
 }
 
 impl Renderer {
@@ -16,8 +57,9 @@ impl Renderer {
 	//public
 
 	pub async fn new(window: Window) -> anyhow::Result<Self> {
-
 		let size = window.inner_size();
+
+		let immediate = Immediate::new(size.width, size.height);
 
 		let window = Arc::new(window);
 
@@ -46,30 +88,40 @@ impl Renderer {
 
 		surface.configure(&device, &surface_config);
 
+		let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+			label: Some("Render Pipeline Layout"),
+			bind_group_layouts: &[],
+			immediate_size: size_of::<Immediate>().try_into()?,
+		});
+
+		let render_pipeline = Self::create_render_pipeline(&device, render_pipeline_layout, &surface_config);
+
 		Ok(Self {
+			render_pipeline,
 			device,
 			queue,
 			surface,
 			surface_config,
+			immediate,
 			window,
 		})
 	}
 
-    pub fn resize(&mut self, width: u32, height: u32) {
-		if 0 < width && 0 < height {
-			self.surface_config.width = width;
-			self.surface_config.height = height;
+    pub fn resize(&mut self) {
+		let size = self.window.inner_size();
+		if 0 < size.width && 0 < size.height {
+			self.surface_config.width = size.width;
+			self.surface_config.height = size.height;
 			self.surface.configure(&self.device, &self.surface_config);
+			self.immediate.update_window_size(size.width, size.height);
 		}
     }
     
     pub fn render(&mut self) {
-
 		let frame = match self.surface.get_current_texture() {
 			Ok(frame) => frame,
 			Err(wgpu::SurfaceError::Outdated) | Err(wgpu::SurfaceError::Lost) => {
-				let size = self.window.inner_size();
-				self.resize(size.width, size.height);
+				self.resize();
 				return;
 			},
 			Err(e) => {
@@ -88,27 +140,26 @@ impl Renderer {
 			label: Some("Render Command Encoder"),
 		});
 
-		let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+		let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
 			label: Some("Render Pass"),
 			color_attachments: &[Some(wgpu::RenderPassColorAttachment {
 				view: &view,
 				depth_slice: None,
 				resolve_target: None,
 				ops: wgpu::Operations {
-					//TEAL
-					load: wgpu::LoadOp::Clear(wgpu::Color {
-						r: 0.016,
-						g: 0.545,
-						b: 0.604,
-						a: 1.0,
-					}),
+					load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
 					store: wgpu::StoreOp::Store,
 				},
 			})],
 			depth_stencil_attachment: None,
 			timestamp_writes: None,
 			occlusion_query_set: None,
+			multiview_mask: None,
 		});
+
+		render_pass.set_pipeline(&self.render_pipeline);
+		render_pass.set_immediates(0, bytemuck::bytes_of(&self.immediate));
+		render_pass.draw(0..3, 0..1);
 
 		drop(render_pass);
 
@@ -141,8 +192,11 @@ impl Renderer {
 		adapter.request_device(
 			&wgpu::DeviceDescriptor {
 				label: Some("Renderer Device"),
-				required_features: wgpu::Features::empty(),
-				required_limits: wgpu::Limits::default(),
+				required_features: wgpu::Features::IMMEDIATES,
+				required_limits: wgpu::Limits {
+					max_immediate_size: size_of::<Immediate>().try_into()?,
+					..wgpu::Limits::default()
+				},
 				experimental_features: wgpu::ExperimentalFeatures::disabled(),
 				memory_hints: wgpu::MemoryHints::Performance,
 				trace: wgpu::Trace::Off,
@@ -166,6 +220,49 @@ impl Renderer {
 		}; 
 
 		surface_caps.alpha_modes.iter().min_by_key(|mode| alpha_mode_preference(**mode)).copied().ok_or(anyhow!("No supported alpha modes found (normaly should not happen)"))
+	}
+
+	fn create_render_pipeline(device: &wgpu::Device, render_pipeline_layout: wgpu::PipelineLayout, surface_config: &wgpu::SurfaceConfiguration) -> wgpu::RenderPipeline {
+		device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Main Render Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &load_shader!(device, "vertex_shader", "Vertex Shader"),
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &load_shader!(device, "fragment_shader", "Fragment Shader"),
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_config.format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent::REPLACE,
+                        alpha: wgpu::BlendComponent::REPLACE,
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: None,
+        })
 	}
 
 }
